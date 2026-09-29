@@ -1014,10 +1014,20 @@ func (r *RoundRobin) GetBannedPairs() []fail2ban.BanPair {
 }
 
 // UpdateDBCredentials atomically replaces the DB-sourced portion of the credential list.
-// Static (YAML-defined) credentials are always preserved unchanged.
-// New credentials are registered in the rate limiter; stale entries are left in the rate
-// limiter but will never be selected since they are absent from the credential list.
-func (r *RoundRobin) UpdateDBCredentials(dbCreds []config.CredentialConfig) {
+//
+// By default (priority=false) a static (YAML-defined) credential always wins a name
+// clash: a DB credential sharing its name is dropped. This is litellm_db's mode — the
+// database is purely additive and can never touch a name the operator already wired in
+// config.yaml.
+//
+// With priority=true the DB credential wins instead: the same-named static credential is
+// dropped from the merge and the DB entry takes over routing for that name (used by
+// air_db.priority — see docs/air-db.md). Every other static name is unaffected.
+//
+// New/kept DB credentials are (re-)registered in the rate limiter; stale entries are left
+// in the rate limiter but will never be selected since they are absent from the
+// credential list.
+func (r *RoundRobin) UpdateDBCredentials(dbCreds []config.CredentialConfig, priority bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -1026,17 +1036,33 @@ func (r *RoundRobin) UpdateDBCredentials(dbCreds []config.CredentialConfig) {
 		existing[credential.Name] = credential
 	}
 
-	// Build name set of static creds so we can skip duplicates from DB.
-	staticNames := make(map[string]bool, len(r.staticCreds))
-	for _, c := range r.staticCreds {
-		staticNames[c.Name] = true
-	}
-
-	// Filter out DB creds that clash with static names.
-	filtered := make([]config.CredentialConfig, 0, len(dbCreds))
-	for _, c := range dbCreds {
-		if !staticNames[c.Name] {
-			filtered = append(filtered, c)
+	effectiveStatic := r.staticCreds
+	var filtered []config.CredentialConfig
+	if priority {
+		// DB wins a name clash: keep every DB credential, drop the static
+		// credential it clashes with (every other static name is untouched).
+		dbNames := make(map[string]bool, len(dbCreds))
+		for _, c := range dbCreds {
+			dbNames[c.Name] = true
+		}
+		effectiveStatic = make([]config.CredentialConfig, 0, len(r.staticCreds))
+		for _, c := range r.staticCreds {
+			if !dbNames[c.Name] {
+				effectiveStatic = append(effectiveStatic, c)
+			}
+		}
+		filtered = append([]config.CredentialConfig(nil), dbCreds...)
+	} else {
+		// Static wins a name clash: filter out DB creds that clash with static names.
+		staticNames := make(map[string]bool, len(r.staticCreds))
+		for _, c := range r.staticCreds {
+			staticNames[c.Name] = true
+		}
+		filtered = make([]config.CredentialConfig, 0, len(dbCreds))
+		for _, c := range dbCreds {
+			if !staticNames[c.Name] {
+				filtered = append(filtered, c)
+			}
 		}
 	}
 
@@ -1044,8 +1070,8 @@ func (r *RoundRobin) UpdateDBCredentials(dbCreds []config.CredentialConfig) {
 	// is_fallback → FallbackPriorityGroup pinning here.
 	config.NormalizeFallbackPriorities(filtered)
 
-	// Merge static + new DB creds.
-	newCreds := append(append([]config.CredentialConfig(nil), r.staticCreds...), filtered...)
+	// Merge effective static + DB creds.
+	newCreds := append(append([]config.CredentialConfig(nil), effectiveStatic...), filtered...)
 	if len(newCreds) == 0 {
 		// Nothing to update — keep existing credentials to avoid empty-list panics.
 		return

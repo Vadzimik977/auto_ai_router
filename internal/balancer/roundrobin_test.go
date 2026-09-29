@@ -1609,7 +1609,7 @@ func TestUpdateDBCredentials(t *testing.T) {
 		{Name: "db-2", APIKey: "dbkey2", RPM: 20, TPM: 50},
 	}
 
-	bal.UpdateDBCredentials(dbCreds)
+	bal.UpdateDBCredentials(dbCreds, false)
 
 	// Static credential must remain, duplicate DB name should be filtered out.
 	assert.Len(t, bal.credentials, 3)
@@ -1642,7 +1642,7 @@ func TestUpdateDBCredentials_FallbackPinnedToGroup999(t *testing.T) {
 	bal.UpdateDBCredentials([]config.CredentialConfig{
 		{Name: "db-fallback", APIKey: "k", RPM: 10, IsFallback: true},
 		{Name: "db-primary", APIKey: "k", RPM: 10},
-	})
+	}, false)
 
 	idx := bal.credentialIndex["db-fallback"]
 	assert.Equal(t, config.FallbackPriorityGroup, bal.credentials[idx].Priority)
@@ -1659,7 +1659,7 @@ func TestUpdateDBCredentials_PreservesProviderScopeMetadata(t *testing.T) {
 	teamA := scope.FromScopes([]string{"team-a"}, nil)
 	require.True(t, bal.UpdateProviderScopes(staticProxy, []string{"team-a"}, nil, teamA, true))
 
-	bal.UpdateDBCredentials(nil)
+	bal.UpdateDBCredentials(nil, false)
 
 	staticSnapshot := bal.GetCredentialsSnapshot()[0]
 	assert.True(t, staticSnapshot.ProviderScopeKnown)
@@ -1669,16 +1669,16 @@ func TestUpdateDBCredentials_PreservesProviderScopeMetadata(t *testing.T) {
 	dbProxy := config.CredentialConfig{
 		Name: "db-proxy", Type: config.ProviderTypeProxy, BaseURL: "http://db.example", APIKey: "key", RPM: -1,
 	}
-	bal.UpdateDBCredentials([]config.CredentialConfig{dbProxy})
+	bal.UpdateDBCredentials([]config.CredentialConfig{dbProxy}, false)
 	require.True(t, bal.UpdateProviderScopes(dbProxy, []string{"team-a"}, nil, teamA, true))
-	bal.UpdateDBCredentials([]config.CredentialConfig{dbProxy})
+	bal.UpdateDBCredentials([]config.CredentialConfig{dbProxy}, false)
 
 	dbSnapshot := bal.GetCredentialsSnapshot()[1]
 	assert.True(t, dbSnapshot.ProviderScopeKnown)
 	assert.True(t, scope.NewContext([]string{"team-a"}, nil).AllowsExpression(dbSnapshot.ProviderScopeExpression))
 
 	dbProxy.IsFallback = true
-	bal.UpdateDBCredentials([]config.CredentialConfig{dbProxy})
+	bal.UpdateDBCredentials([]config.CredentialConfig{dbProxy}, false)
 	dbSnapshot = bal.GetCredentialsSnapshot()[1]
 	assert.False(t, dbSnapshot.ProviderScopeKnown)
 	assert.False(t, scope.AdminContext().AllowsExpression(dbSnapshot.ProviderScopeExpression))
@@ -1705,11 +1705,66 @@ func TestUpdateDBCredentials_PreservesSWRRState(t *testing.T) {
 
 	bal.UpdateDBCredentials([]config.CredentialConfig{
 		{Name: "db-1", APIKey: "dbkey1", BaseURL: "http://db1.com", RPM: -1},
-	})
+	}, false)
 
 	assert.Same(t, state, bal.swrr[key], "DB sync should not reset existing SWRR cycles")
 	assert.Equal(t, beforeYAML1, state.currentOf("yaml-1"))
 	assert.Equal(t, beforeYAML2, state.currentOf("yaml-2"))
+}
+
+// TestUpdateDBCredentials_Priority verifies the air_db priority mode: a DB credential
+// wins a name clash and the same-named static credential is dropped from routing, while
+// every other static name is untouched.
+func TestUpdateDBCredentials_Priority(t *testing.T) {
+	f2b := fail2ban.New(3, 0, []int{401, 403, 500})
+	rl := ratelimit.New()
+
+	staticCreds := []config.CredentialConfig{
+		{Name: "shared", APIKey: "static-key", BaseURL: "http://static.example", RPM: 100},
+		{Name: "yaml-only", APIKey: "key2", BaseURL: "http://test2.com", RPM: -1},
+	}
+	bal := New(staticCreds, f2b, rl)
+
+	dbCreds := []config.CredentialConfig{
+		{Name: "shared", APIKey: "db-key", BaseURL: "http://db.example", RPM: 10},
+		{Name: "db-only", APIKey: "dbkey2", RPM: 20},
+	}
+
+	bal.UpdateDBCredentials(dbCreds, true)
+
+	// "shared" must come from the DB now (api_key/base_url replaced), "yaml-only" and
+	// "db-only" are unaffected additions.
+	assert.Len(t, bal.credentials, 3)
+	byName := make(map[string]config.CredentialConfig, len(bal.credentials))
+	for _, c := range bal.credentials {
+		byName[c.Name] = c
+	}
+	require.Contains(t, byName, "shared")
+	assert.Equal(t, "db-key", byName["shared"].APIKey, "priority=true must let the DB credential win the name clash")
+	assert.Equal(t, "http://db.example", byName["shared"].BaseURL)
+	require.Contains(t, byName, "yaml-only")
+	assert.Equal(t, "key2", byName["yaml-only"].APIKey, "a name air_db does not declare must keep the static entry")
+	require.Contains(t, byName, "db-only")
+}
+
+// TestUpdateDBCredentials_PriorityFalseKeepsStaticWinning is the control case: with
+// priority=false (litellm_db's mode), the pre-existing "static always wins" behaviour is
+// unchanged by the new parameter.
+func TestUpdateDBCredentials_PriorityFalseKeepsStaticWinning(t *testing.T) {
+	f2b := fail2ban.New(3, 0, []int{401, 403, 500})
+	rl := ratelimit.New()
+
+	staticCreds := []config.CredentialConfig{
+		{Name: "shared", APIKey: "static-key", RPM: 100},
+	}
+	bal := New(staticCreds, f2b, rl)
+
+	bal.UpdateDBCredentials([]config.CredentialConfig{
+		{Name: "shared", APIKey: "db-key", RPM: 10},
+	}, false)
+
+	assert.Len(t, bal.credentials, 1)
+	assert.Equal(t, "static-key", bal.credentials[0].APIKey)
 }
 
 // --- T2: priority-group primary selection tests ---

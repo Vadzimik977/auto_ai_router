@@ -520,6 +520,16 @@ func main() {
 		}
 	}
 
+	// Shutdown air_db
+	if airDBManager.IsEnabled() {
+		log.Info("Shutting down air_db...")
+		airShutdownCtx, airShutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer airShutdownCancel()
+		if err := airDBManager.Shutdown(airShutdownCtx); err != nil {
+			log.Error("air_db shutdown error", "error", err)
+		}
+	}
+
 	// Shutdown Kafka spend-log publisher
 	if kafkaLogManager.IsEnabled() {
 		log.Info("Shutting down Kafka spend-log publisher...")
@@ -916,7 +926,8 @@ func syncDBModelTable(
 	}
 
 	// Apply DB credentials to balancer (diff is computed inside UpdateDBCredentials).
-	bal.UpdateDBCredentials(dbCreds)
+	// litellm_db is always additive: a static credential wins any name clash.
+	bal.UpdateDBCredentials(dbCreds, false)
 
 	// Build the current complete credential list (static + new DB) for model mapping.
 	allCreds := append(append([]config.CredentialConfig(nil), staticCreds...), dbCreds...)
@@ -988,7 +999,8 @@ func applyInitialDBModelTable(
 		return
 	}
 
-	bal.UpdateDBCredentials(dbCreds)
+	// litellm_db is always additive: a static credential wins any name clash.
+	bal.UpdateDBCredentials(dbCreds, false)
 
 	allCreds := append(append([]config.CredentialConfig(nil), staticCreds...), dbCreds...)
 	modelManager.UpdateDBModels(dbModelCfgs, staticCreds, allCreds)
@@ -1212,6 +1224,23 @@ func syncAirDBSources(
 		return
 	}
 
+	applyAirDBSnapshot(log, dbCreds, dbModelCfgs, staticCreds, bal, modelManager, rateLimiter, priority)
+	log.Debug("air_db sync completed", "credentials", len(dbCreds), "models", len(dbModelCfgs))
+}
+
+// applyAirDBSnapshot applies an already-fetched air_db snapshot to the balancer, model
+// manager and rate limiter. Pulled out of syncAirDBSources so applyInitialAirDBSources can
+// apply the startup snapshot without a second round trip to the database.
+func applyAirDBSnapshot(
+	log *slog.Logger,
+	dbCreds []config.CredentialConfig,
+	dbModelCfgs []config.ModelRPMConfig,
+	staticCreds []config.CredentialConfig,
+	bal *balancer.RoundRobin,
+	modelManager *models.Manager,
+	rateLimiter *ratelimit.RPMLimiter,
+	priority bool,
+) {
 	effectiveStatic := staticCreds
 	if priority {
 		var overriddenCreds map[string]bool
@@ -1223,7 +1252,9 @@ func syncAirDBSources(
 
 	// Apply DB credentials to balancer (diff is computed inside
 	// UpdateDBCredentials; a second call replaces the DB-sourced portion).
-	bal.UpdateDBCredentials(dbCreds)
+	// priority=true here really does make the air_db entry win a name clash
+	// at the routing level — the balancer drops the same-named static entry.
+	bal.UpdateDBCredentials(dbCreds, priority)
 
 	allCreds := append(append([]config.CredentialConfig(nil), effectiveStatic...), dbCreds...)
 	modelManager.UpdateDBModels(dbModelCfgs, effectiveStatic, allCreds)
@@ -1243,8 +1274,6 @@ func syncAirDBSources(
 			}
 		}
 	}
-
-	log.Debug("air_db sync completed", "credentials", len(dbCreds), "models", len(dbModelCfgs))
 }
 
 // applyInitialAirDBSources applies air_db data at startup through the same
@@ -1262,15 +1291,16 @@ func applyInitialAirDBSources(
 	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	if _, _, err := airManager.Fetch(fetchCtx); err != nil {
+	dbCreds, dbModelCfgs, err := airManager.Fetch(fetchCtx)
+	if err != nil {
 		log.Warn("Failed to load initial air_db data (continuing without air_db credentials/models)",
 			"error", err,
 		)
 		return
 	}
 
-	syncAirDBSources(ctx, log, airManager, staticCreds, bal, modelManager, rateLimiter, priority)
-	log.Info("Applied initial air_db sources")
+	applyAirDBSnapshot(log, dbCreds, dbModelCfgs, staticCreds, bal, modelManager, rateLimiter, priority)
+	log.Info("Applied initial air_db sources", "credentials", len(dbCreds), "models", len(dbModelCfgs))
 }
 
 // initializeKafkaLog sets up the Kafka spend-log publisher (internal/kafkalog),
