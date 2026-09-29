@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mixaill76/auto_ai_router/internal/airdb"
 	"github.com/mixaill76/auto_ai_router/internal/auth"
 	"github.com/mixaill76/auto_ai_router/internal/balancer"
 	"github.com/mixaill76/auto_ai_router/internal/config"
@@ -129,6 +130,7 @@ func main() {
 	}
 
 	litellmDBManager := initializeLiteLLMDB(cfg, log)
+	airDBManager := initializeAirDB(cfg, log)
 	kafkaLogManager := initializeKafkaLog(cfg, log, litellmDBManager)
 	rawBodyLogManager := initializeRawBodyLog(cfg, log)
 
@@ -185,7 +187,17 @@ func main() {
 	// static vs. DB-sourced credentials.
 	staticCreds := append([]config.CredentialConfig(nil), cfg.Credentials...)
 	if litellmDBManager.IsEnabled() {
-		applyInitialDBModelTable(context.Background(), litellmDBManager, staticCreds, bal, modelManager, rateLimiter, priceRegistry, cfg, log)
+		if airDBManager.IsEnabled() {
+			// air_db is the authoritative credential/model source: it replaces
+			// the LiteLLM model-table sync entirely (litellm_db keeps its
+			// auth/spend roles — they live in separate tables).
+			log.Info("air_db enabled: skipping LiteLLM DB credential/model table sync (litellm_db keeps auth/spend only)")
+		} else {
+			applyInitialDBModelTable(context.Background(), litellmDBManager, staticCreds, bal, modelManager, rateLimiter, priceRegistry, cfg, log)
+		}
+	}
+	if airDBManager.IsEnabled() {
+		applyInitialAirDBSources(context.Background(), airDBManager, staticCreds, bal, modelManager, rateLimiter, cfg.AirDB.Priority, log)
 	}
 	modelManager.SetExternalModelIDs(cfg.Video.ModelIDs())
 	organizationPolicies := loadOrganizationPoliciesOrExit(log, cfg, modelManager)
@@ -310,7 +322,7 @@ func main() {
 		startResponseStoreCleanup(bgCtx, log, respStore, &wg)
 	}
 
-	if litellmDBManager.IsEnabled() {
+	if litellmDBManager.IsEnabled() && !airDBManager.IsEnabled() {
 		startDBHealthMonitor(bgCtx, log, litellmDBManager, healthChecker, &wg)
 		if err := litellmDBManager.FetchMasterKey(bgCtx, cfg.Server.MasterKey); err != nil {
 			log.Warn("Failed to fetch master key from LiteLLM DB.", "error", err)
@@ -319,6 +331,10 @@ func main() {
 			startDBModelTableSyncLoop(bgCtx, log, litellmDBManager, staticCreds,
 				bal, modelManager, rateLimiter, priceRegistry, cfg, cfg.LiteLLMDB.LitellmDBSyncInterval, &wg)
 		}
+	}
+	if airDBManager.IsEnabled() {
+		startAirDBSyncLoop(bgCtx, log, airDBManager, staticCreds,
+			bal, modelManager, rateLimiter, cfg.AirDB.Priority, cfg.AirDB.SyncInterval, &wg)
 	}
 
 	// Start model price sync loop (only if configured)
@@ -1087,6 +1103,174 @@ func initializeLiteLLMDB(cfg *config.Config, log *slog.Logger) litellmdb.Manager
 	}
 	log.Info("LiteLLM DB integration initialized successfully")
 	return manager
+}
+
+// initializeAirDB sets up the native air_db Postgres source. A failed
+// connection degrades to a NoopManager unless air_db.is_required is set, in
+// which case startup aborts: with air_db enabled the router's routing table
+// depends on it.
+func initializeAirDB(cfg *config.Config, log *slog.Logger) airdb.Manager {
+	if !cfg.AirDB.Enabled {
+		log.Info("air_db disabled - using NoopManager")
+		return airdb.NoopManager{}
+	}
+
+	log.Info("Initializing air_db...", "is_required", cfg.AirDB.IsRequired, "priority", cfg.AirDB.Priority)
+
+	airCfg := &airdb.Config{
+		DatabaseURL:    cfg.AirDB.DatabaseURL,
+		MaxConns:       cfg.AirDB.MaxConns,
+		MinConns:       cfg.AirDB.MinConns,
+		ConnectTimeout: cfg.AirDB.ConnectTimeout,
+		Logger:         log,
+	}
+
+	manager, err := airdb.New(airCfg)
+	if err != nil {
+		if cfg.AirDB.IsRequired {
+			log.Error("CRITICAL: Failed to initialize required air_db",
+				"error", err,
+				"reason", "air_db is configured as required (is_required=true)",
+				"action", "Fix database connectivity or set is_required=false",
+			)
+			os.Exit(1)
+		}
+		log.Warn("Failed to initialize optional air_db, degrading to NoopManager",
+			"error", err,
+			"impact", "Credentials and models from air_credentials/air_models will not be loaded",
+		)
+		return airdb.NoopManager{}
+	}
+	log.Info("air_db initialized successfully")
+	return manager
+}
+
+// startAirDBSyncLoop periodically reloads credentials and models from air_db
+// and applies a diff to the live router (same contract as the LiteLLM DB sync
+// loop: static YAML entries are never modified).
+func startAirDBSyncLoop(
+	bgCtx context.Context,
+	log *slog.Logger,
+	airManager airdb.Manager,
+	staticCreds []config.CredentialConfig,
+	bal *balancer.RoundRobin,
+	modelManager *models.Manager,
+	rateLimiter *ratelimit.RPMLimiter,
+	priority bool,
+	interval time.Duration,
+	wg *sync.WaitGroup,
+) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-bgCtx.Done():
+				log.Debug("air_db sync loop stopped")
+				return
+			case <-ticker.C:
+				syncAirDBSources(bgCtx, log, airManager, staticCreds, bal, modelManager, rateLimiter, priority)
+			}
+		}
+	}()
+
+	log.Info("air_db sync loop started", "interval", interval, "priority", priority)
+}
+
+// syncAirDBSources performs one air_db sync cycle.
+//
+// Credentials: with priority=true a static YAML credential whose name air_db
+// also declares is dropped from the static baseline (the database entry
+// replaces it — balancer-level, fully supported). Without priority air_db is
+// purely additive, matching the LiteLLM DB loader.
+//
+// Models: air_db model limits are always merged WITH the static snapshot
+// (UpdateDBModels appends per model name, exactly like the LiteLLM loader):
+// the model manager's static portion is immutable and cannot be removed per
+// entry. To get "database only" semantics for a model, do not declare it in
+// config.yaml — the same rule already applies to litellm_db.
+func syncAirDBSources(
+	ctx context.Context,
+	log *slog.Logger,
+	airManager airdb.Manager,
+	staticCreds []config.CredentialConfig,
+	bal *balancer.RoundRobin,
+	modelManager *models.Manager,
+	rateLimiter *ratelimit.RPMLimiter,
+	priority bool,
+) {
+	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	dbCreds, dbModelCfgs, err := airManager.Fetch(fetchCtx)
+	if err != nil {
+		log.Warn("air_db sync: fetch failed", "error", err)
+		return
+	}
+
+	effectiveStatic := staticCreds
+	if priority {
+		var overriddenCreds map[string]bool
+		effectiveStatic, overriddenCreds = airdb.FilterStaticCredentials(staticCreds, dbCreds)
+		for name := range overriddenCreds {
+			log.Info("air_db priority: static credential replaced by database entry", "credential", name)
+		}
+	}
+
+	// Apply DB credentials to balancer (diff is computed inside
+	// UpdateDBCredentials; a second call replaces the DB-sourced portion).
+	bal.UpdateDBCredentials(dbCreds)
+
+	allCreds := append(append([]config.CredentialConfig(nil), effectiveStatic...), dbCreds...)
+	modelManager.UpdateDBModels(dbModelCfgs, effectiveStatic, allCreds)
+	modelManager.SetCredentials(allCreds)
+
+	// Upsert rate limiter entries for all air_db credential+model pairs.
+	for _, dm := range dbModelCfgs {
+		if dm.Credential != "" {
+			rateLimiter.AddModelWithTPM(dm.Credential, dm.Name, dm.RPM, dm.TPM)
+		} else {
+			credTargets := effectiveStatic
+			if len(credTargets) == 0 {
+				credTargets = dbCreds
+			}
+			for _, cred := range credTargets {
+				rateLimiter.AddModelWithTPM(cred.Name, dm.Name, dm.RPM, dm.TPM)
+			}
+		}
+	}
+
+	log.Debug("air_db sync completed", "credentials", len(dbCreds), "models", len(dbModelCfgs))
+}
+
+// applyInitialAirDBSources applies air_db data at startup through the same
+// code path as the sync loop (like applyInitialDBModelTable does for LiteLLM).
+func applyInitialAirDBSources(
+	ctx context.Context,
+	airManager airdb.Manager,
+	staticCreds []config.CredentialConfig,
+	bal *balancer.RoundRobin,
+	modelManager *models.Manager,
+	rateLimiter *ratelimit.RPMLimiter,
+	priority bool,
+	log *slog.Logger,
+) {
+	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	if _, _, err := airManager.Fetch(fetchCtx); err != nil {
+		log.Warn("Failed to load initial air_db data (continuing without air_db credentials/models)",
+			"error", err,
+		)
+		return
+	}
+
+	syncAirDBSources(ctx, log, airManager, staticCreds, bal, modelManager, rateLimiter, priority)
+	log.Info("Applied initial air_db sources")
 }
 
 // initializeKafkaLog sets up the Kafka spend-log publisher (internal/kafkalog),

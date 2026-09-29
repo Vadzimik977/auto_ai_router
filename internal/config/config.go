@@ -114,6 +114,12 @@ func normalizeProviderType(raw string) ProviderType {
 	}
 }
 
+// NormalizeProviderType is the exported form of normalizeProviderType, used by
+// the air_db loader so provider-name mapping has one source of truth.
+func NormalizeProviderType(raw string) ProviderType {
+	return normalizeProviderType(raw)
+}
+
 // VLLMLiteLLMProvider is LiteLLM's name for the vLLM provider: custom_llm_provider
 // "hosted_vllm" and the "hosted_vllm/<model>" model prefix.
 const VLLMLiteLLMProvider = "hosted_vllm"
@@ -250,10 +256,15 @@ type Config struct {
 	AcceptedModelAlias   map[string]string          `yaml:"accepted_model_alias,omitempty"`
 	OrganizationPolicies []OrganizationPolicyConfig `yaml:"organization_policies,omitempty"`
 	LiteLLMDB            LiteLLMDBConfig            `yaml:"litellm_db,omitempty"`
-	Redis                RedisConfig                `yaml:"redis,omitempty"`
-	OTEL                 OTELConfig                 `yaml:"otel,omitempty"`
-	Kafka                KafkaConfig                `yaml:"kafka,omitempty"`
-	Video                VideoConfig                `yaml:"video,omitempty"`
+	// AirDB is a native Postgres source for credentials and models whose tables
+	// mirror the services jsonnet format (see docs/air-db.md). When enabled it
+	// merges with the YAML-static credentials/models; with Priority set, an
+	// air_db entry of the same name replaces the static one.
+	AirDB AirDBConfig `yaml:"air_db,omitempty"`
+	Redis RedisConfig `yaml:"redis,omitempty"`
+	OTEL  OTELConfig  `yaml:"otel,omitempty"`
+	Kafka KafkaConfig `yaml:"kafka,omitempty"`
+	Video VideoConfig `yaml:"video,omitempty"`
 	// ModelTemplates stores x-model-templates entries as raw interface{} so that
 	// both single-model mappings and lists of models can be defined as YAML anchors
 	// without type errors. The actual model data is extracted via anchor expansion.
@@ -282,6 +293,7 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 		AcceptedModelAlias   map[string]string          `yaml:"accepted_model_alias,omitempty"`
 		OrganizationPolicies []OrganizationPolicyConfig `yaml:"organization_policies,omitempty"`
 		LiteLLMDB            LiteLLMDBConfig            `yaml:"litellm_db,omitempty"`
+		AirDB                AirDBConfig                `yaml:"air_db,omitempty"`
 		Redis                RedisConfig                `yaml:"redis,omitempty"`
 		OTEL                 OTELConfig                 `yaml:"otel,omitempty"`
 		Kafka                KafkaConfig                `yaml:"kafka,omitempty"`
@@ -306,6 +318,7 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 	c.AcceptedModelAlias = raw.AcceptedModelAlias
 	c.OrganizationPolicies = raw.OrganizationPolicies
 	c.LiteLLMDB = raw.LiteLLMDB
+	c.AirDB = raw.AirDB
 	c.Redis = raw.Redis
 	c.OTEL = raw.OTEL
 	c.Kafka = raw.Kafka
@@ -1232,6 +1245,87 @@ type LiteLLMDBConfig struct {
 	EnableCostMargin bool `yaml:"enable_cost_margin"` // default: false (opt-in)
 }
 
+// AirDBConfig holds configuration for the native air_db Postgres source of
+// credentials and models. Unlike litellm_db the tables mirror the services
+// jsonnet format (air_credentials / air_models) and API keys are stored only
+// as "os.environ/KEY" references, never as values. See docs/air-db.md.
+type AirDBConfig struct {
+	// Enable/disable module.
+	Enabled bool `yaml:"enabled"` // default: false
+
+	// IsRequired fails startup when the database is unreachable instead of
+	// degrading to a NoopManager.
+	IsRequired bool `yaml:"is_required"` // default: false
+
+	// Priority makes air_db the authoritative source: a credential or model
+	// with the same name as a YAML-static one replaces it instead of being
+	// added alongside. Without Priority, air_db behaves like litellm_db and
+	// only adds entries whose names do not exist in the static config.
+	Priority bool `yaml:"priority"` // default: false
+
+	// DatabaseURL postgresql://[user[:password]@][netloc][:port][/dbname]
+	DatabaseURL string `yaml:"database_url"` // os.environ/AIR_DATABASE_URL
+
+	MaxConns int32 `yaml:"max_conns"` // default: 10
+	MinConns int32 `yaml:"min_conns"` // default: 2
+
+	ConnectTimeout time.Duration `yaml:"connect_timeout"` // default: 5s
+
+	// SyncInterval is how often credentials/models are re-fetched (default 1m).
+	SyncInterval time.Duration `yaml:"sync_interval"` // default: 1m
+}
+
+// UnmarshalYAML implements custom unmarshaling for AirDBConfig with env
+// variable support (same pattern as LiteLLMDBConfig).
+func (a *AirDBConfig) UnmarshalYAML(value *yaml.Node) error {
+	type tempConfig struct {
+		Enabled        string `yaml:"enabled"`
+		IsRequired     string `yaml:"is_required"`
+		Priority       string `yaml:"priority"`
+		DatabaseURL    string `yaml:"database_url"`
+		MaxConns       string `yaml:"max_conns"`
+		MinConns       string `yaml:"min_conns"`
+		ConnectTimeout string `yaml:"connect_timeout"`
+		SyncInterval   string `yaml:"sync_interval"`
+	}
+
+	var temp tempConfig
+	if err := value.Decode(&temp); err != nil {
+		return err
+	}
+
+	var err error
+	a.DatabaseURL = resolveEnvString(temp.DatabaseURL)
+	if a.Enabled, err = parseField(temp.Enabled, false, strconv.ParseBool, "air_db.enabled"); err != nil {
+		return err
+	}
+	if a.IsRequired, err = parseField(temp.IsRequired, false, strconv.ParseBool, "air_db.is_required"); err != nil {
+		return err
+	}
+	if a.Priority, err = parseField(temp.Priority, false, strconv.ParseBool, "air_db.priority"); err != nil {
+		return err
+	}
+	if a.MaxConns, err = parseField(temp.MaxConns, int32(10), func(s string) (int32, error) {
+		n, err := strconv.Atoi(s)
+		return int32(n), err
+	}, "air_db.max_conns"); err != nil {
+		return err
+	}
+	if a.MinConns, err = parseField(temp.MinConns, int32(2), func(s string) (int32, error) {
+		n, err := strconv.Atoi(s)
+		return int32(n), err
+	}, "air_db.min_conns"); err != nil {
+		return err
+	}
+	if a.ConnectTimeout, err = parseField(temp.ConnectTimeout, 5*time.Second, time.ParseDuration, "air_db.connect_timeout"); err != nil {
+		return err
+	}
+	if a.SyncInterval, err = parseField(temp.SyncInterval, 1*time.Minute, time.ParseDuration, "air_db.sync_interval"); err != nil {
+		return err
+	}
+	return nil
+}
+
 // KafkaConfig holds configuration for the Kafka spend-log analytics write-path
 // (internal/kafkalog). When Enabled=false (default) no producer is started and
 // spend events are only written to LiteLLM Postgres (unless disabled there too).
@@ -1774,6 +1868,10 @@ func Load(path string) (*Config, error) {
 		cfg.LiteLLMDB = defaultLiteLLMDBConfig()
 	}
 
+	if !hasMappingKey(&root, "air_db") {
+		cfg.AirDB = defaultAirDBConfig()
+	}
+
 	if !hasMappingKey(&root, "otel") {
 		cfg.OTEL = defaultOTELConfig()
 	}
@@ -1905,6 +2003,19 @@ func defaultRedisConfig() RedisConfig {
 	}
 	r.BalancerKeyPrefix = r.KeyPrefix
 	return r
+}
+
+func defaultAirDBConfig() AirDBConfig {
+	return AirDBConfig{
+		Enabled:        false,
+		IsRequired:     false,
+		Priority:       false,
+		DatabaseURL:    "",
+		MaxConns:       10,
+		MinConns:       2,
+		ConnectTimeout: 5 * time.Second,
+		SyncInterval:   1 * time.Minute,
+	}
 }
 
 func defaultLiteLLMDBConfig() LiteLLMDBConfig {
