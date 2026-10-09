@@ -83,6 +83,27 @@ jobs:
             type=raw,value=dev-latest,enable=${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
             type=raw,value=${{ github.ref_name }}-latest,enable=${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
             type=sha,prefix=sha-
+      # Pre-pull the Dockerfile's base images with retry/backoff before buildx:
+      # Docker Hub's auth endpoint (auth.docker.io) intermittently returns 504
+      # from GitHub-hosted runners for minutes at a time, and buildx aborts on
+      # the first token-fetch error. build-push-action pulls only when the
+      # image is missing locally (pull defaults to false), so a pre-pulled
+      # image is reused. Keep the list in sync with the FROM lines in
+      # Dockerfile.
+      - name: Pre-pull base images
+        run: |
+          for img in golang:1.27-alpine gcr.io/distroless/static-debian12:nonroot; do
+            attempt=0
+            until docker pull "$img"; do
+              attempt=$((attempt + 1))
+              if [ "$attempt" -ge 5 ]; then
+                echo "::error::failed to pull $img after 5 attempts"
+                exit 1
+              fi
+              echo "pull $img failed (attempt $attempt/5), retrying in 60s"
+              sleep 60
+            done
+          done
       - name: Build
         id: build
         continue-on-error: true
@@ -98,6 +119,13 @@ jobs:
           build-args: |
             VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
             COMMIT=${{ github.sha }}
+
+      # The retry below fires immediately after the failed attempt; during a
+      # multi-minute registry auth outage that just hits the same wall. Give
+      # the outage time to clear before the second attempt.
+      - name: Wait before retry
+        if: steps.build.outcome == 'failure'
+        run: sleep 90
 
       - name: Build (retry)
         if: steps.build.outcome == 'failure'
